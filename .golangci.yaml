@@ -1,0 +1,33 @@
+run:
+  timeout: 5m
+  tests: false
+  silent: true
+
+output:
+  format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true
+
+linters:
+  disable:
+    - wsl
+    - gochecknoglobals
+    - lll
+    - funlen
+    - gochecknoinits
+    - sqlclosecheck
+    - dupl
+    - gci
+    - nlreturn
+    - bodyclose
+    - gomnd
+    - noctx
+    - maligned
+    - exhaustivestruct
+    - wrapcheck
+
+issues:
+  exclude-use-default: false
+  exclude:
+    - G304
+    - G204
