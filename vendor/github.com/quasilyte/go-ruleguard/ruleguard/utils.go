@@ -2,47 +2,52 @@ package ruleguard
 
 import (
 	"go/ast"
+	"go/constant"
 	"go/parser"
-	"go/printer"
 	"go/token"
 	"go/types"
 	"strconv"
 	"strings"
 )
 
-func unquoteNode(lit *ast.BasicLit) string {
-	return lit.Value[1 : len(lit.Value)-1]
+func findDependency(pkg *types.Package, path string) *types.Package {
+	if pkg.Path() == path {
+		return pkg
+	}
+	// It looks like indirect dependencies are always incomplete?
+	// If it's true, then we don't have to recurse here.
+	for _, imported := range pkg.Imports() {
+		if dep := findDependency(imported, path); dep != nil && dep.Complete() {
+			return dep
+		}
+	}
+	return nil
 }
 
-func sprintNode(fset *token.FileSet, n ast.Node) string {
-	if fset == nil {
-		fset = token.NewFileSet()
-	}
-	var buf strings.Builder
-	if err := printer.Fprint(&buf, fset, n); err != nil {
-		return ""
-	}
-	return buf.String()
-}
+var typeByName = map[string]types.Type{
+	// Predeclared types.
+	`error`:      types.Universe.Lookup("error").Type(),
+	`bool`:       types.Typ[types.Bool],
+	`int`:        types.Typ[types.Int],
+	`int8`:       types.Typ[types.Int8],
+	`int16`:      types.Typ[types.Int16],
+	`int32`:      types.Typ[types.Int32],
+	`int64`:      types.Typ[types.Int64],
+	`uint`:       types.Typ[types.Uint],
+	`uint8`:      types.Typ[types.Uint8],
+	`uint16`:     types.Typ[types.Uint16],
+	`uint32`:     types.Typ[types.Uint32],
+	`uint64`:     types.Typ[types.Uint64],
+	`uintptr`:    types.Typ[types.Uintptr],
+	`string`:     types.Typ[types.String],
+	`float32`:    types.Typ[types.Float32],
+	`float64`:    types.Typ[types.Float64],
+	`complex64`:  types.Typ[types.Complex64],
+	`complex128`: types.Typ[types.Complex128],
 
-var basicTypeByName = map[string]types.Type{
-	"bool":       types.Typ[types.Bool],
-	"int":        types.Typ[types.Int],
-	"int8":       types.Typ[types.Int8],
-	"int16":      types.Typ[types.Int16],
-	"int32":      types.Typ[types.Int32],
-	"int64":      types.Typ[types.Int64],
-	"uint":       types.Typ[types.Uint],
-	"uint8":      types.Typ[types.Uint8],
-	"uint16":     types.Typ[types.Uint16],
-	"uint32":     types.Typ[types.Uint32],
-	"uint64":     types.Typ[types.Uint64],
-	"uintptr":    types.Typ[types.Uintptr],
-	"float32":    types.Typ[types.Float32],
-	"float64":    types.Typ[types.Float64],
-	"complex64":  types.Typ[types.Complex64],
-	"complex128": types.Typ[types.Complex128],
-	"string":     types.Typ[types.String],
+	// Predeclared aliases (provided for convenience).
+	`byte`: types.Typ[types.Uint8],
+	`rune`: types.Typ[types.Int32],
 }
 
 func typeFromString(s string) (types.Type, error) {
@@ -58,9 +63,9 @@ func typeFromString(s string) (types.Type, error) {
 func typeFromNode(e ast.Expr) types.Type {
 	switch e := e.(type) {
 	case *ast.Ident:
-		basic, ok := basicTypeByName[e.Name]
+		typ, ok := typeByName[e.Name]
 		if ok {
-			return basic
+			return typ
 		}
 
 	case *ast.ArrayType:
@@ -79,7 +84,7 @@ func typeFromNode(e ast.Expr) types.Type {
 		if err != nil {
 			return nil
 		}
-		types.NewArray(elem, int64(length))
+		return types.NewArray(elem, int64(length))
 
 	case *ast.MapType:
 		keyType := typeFromNode(e.Key)
@@ -108,6 +113,17 @@ func typeFromNode(e ast.Expr) types.Type {
 	}
 
 	return nil
+}
+
+func intValueOf(info *types.Info, expr ast.Expr) constant.Value {
+	tv := info.Types[expr]
+	if tv.Value == nil {
+		return nil
+	}
+	if tv.Value.Kind() != constant.Int {
+		return nil
+	}
+	return tv.Value
 }
 
 // isPure reports whether expr is a softly safe expression and contains
