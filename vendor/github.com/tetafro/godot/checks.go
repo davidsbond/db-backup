@@ -16,9 +16,10 @@ const (
 var (
 	// List of valid sentence ending.
 	// A sentence can be inside parenthesis, and therefore ends with parenthesis.
-	// A colon is a valid sentence ending, because it can be followed by a
-	// code example which is not checked.
-	lastChars = []string{".", "?", "!", ".)", "?)", "!)", ":"}
+	lastChars = []string{".", "?", "!", ".)", "?)", "!)", "。", "？", "！", "。）", "？）", "！）", specialReplacer}
+
+	// Abbreviations to exclude from capital letters check.
+	abbreviations = []string{"i.e.", "i. e.", "e.g.", "e. g.", "etc."}
 
 	// Special tags in comments like "// nolint:", or "// +k8s:".
 	tags = regexp.MustCompile(`^\+?[a-z0-9]+:`)
@@ -32,21 +33,16 @@ var (
 
 // checkComments checks every comment accordings to the rules from
 // `settings` argument.
-func checkComments(fset *token.FileSet, comments []comment, settings Settings) []Issue {
+func checkComments(comments []comment, settings Settings) []Issue {
 	var issues []Issue // nolint: prealloc
 	for _, c := range comments {
-		if c.ast == nil || len(c.ast.List) == 0 {
-			continue
-		}
-
 		if settings.Period {
-			if iss := checkCommentForPeriod(fset, c); iss != nil {
+			if iss := checkCommentForPeriod(c); iss != nil {
 				issues = append(issues, *iss)
 			}
 		}
-
 		if settings.Capital {
-			if iss := checkCommentForCapital(fset, c); len(iss) > 0 {
+			if iss := checkCommentForCapital(c); len(iss) > 0 {
 				issues = append(issues, iss...)
 			}
 		}
@@ -56,29 +52,26 @@ func checkComments(fset *token.FileSet, comments []comment, settings Settings) [
 
 // checkCommentForPeriod checks that the last sentense of the comment ends
 // in a period.
-func checkCommentForPeriod(fset *token.FileSet, c comment) *Issue {
-	// Save global line number and indent
-	start := fset.Position(c.ast.List[0].Slash)
-
-	text := getText(c.ast)
-
-	pos, ok := checkPeriod(text)
+func checkCommentForPeriod(c comment) *Issue {
+	pos, ok := checkPeriod(c.text)
 	if ok {
 		return nil
 	}
 
-	// Shift position by the length of comment's special symbols: /* or //
-	isBlock := strings.HasPrefix(c.ast.List[0].Text, "/*")
-	if (isBlock && pos.line == 1) || !isBlock {
-		pos.column += 2
-	}
+	// Shift position to its real value. `c.text` doesn't contain comment's
+	// special symbols: /* or //, and line indentations inside. It also
+	// contains */ in the end in case of block comment.
+	pos.column += strings.Index(
+		c.lines[pos.line-1],
+		strings.Split(c.text, "\n")[pos.line-1],
+	)
 
 	iss := Issue{
 		Pos: token.Position{
-			Filename: start.Filename,
-			Offset:   start.Offset,
-			Line:     pos.line + start.Line - 1,
-			Column:   pos.column + start.Column - 1,
+			Filename: c.start.Filename,
+			Offset:   c.start.Offset,
+			Line:     pos.line + c.start.Line - 1,
+			Column:   pos.column,
 		},
 		Message: noPeriodMessage,
 	}
@@ -86,9 +79,13 @@ func checkCommentForPeriod(fset *token.FileSet, c comment) *Issue {
 	// Make a replacement. Use `pos.line` to get an original line from
 	// attached lines. Use `iss.Pos.Column` because it's a position in
 	// the original line.
-	original := []rune(c.lines[pos.line-1])
-	iss.Replacement = string(original[:iss.Pos.Column-1]) + "." +
-		string(original[iss.Pos.Column-1:])
+	original := c.lines[pos.line-1]
+	if len(original) < iss.Pos.Column-1 {
+		// This should never happen. Avoid panics, skip this check.
+		return nil
+	}
+	iss.Replacement = original[:iss.Pos.Column-1] + "." +
+		original[iss.Pos.Column-1:]
 
 	// Save replacement to raw lines to be able to combine it with
 	// further replacements
@@ -97,16 +94,11 @@ func checkCommentForPeriod(fset *token.FileSet, c comment) *Issue {
 	return &iss
 }
 
-// checkCommentForCapital checks that the each sentense of the comment starts with
+// checkCommentForCapital checks that each sentense of the comment starts with
 // a capital letter.
 // nolint: unparam
-func checkCommentForCapital(fset *token.FileSet, c comment) []Issue {
-	// Save global line number and indent
-	start := fset.Position(c.ast.List[0].Slash)
-
-	text := getText(c.ast)
-
-	pp := checkCapital(text, c.decl)
+func checkCommentForCapital(c comment) []Issue {
+	pp := checkCapital(c.text, c.decl)
 	if len(pp) == 0 {
 		return nil
 	}
@@ -114,27 +106,33 @@ func checkCommentForCapital(fset *token.FileSet, c comment) []Issue {
 	issues := make([]Issue, len(pp))
 	for i, pos := range pp {
 		// Shift position by the length of comment's special symbols: /* or //
-		isBlock := strings.HasPrefix(c.ast.List[0].Text, "/*")
+		isBlock := strings.HasPrefix(c.lines[0], "/*")
 		if (isBlock && pos.line == 1) || !isBlock {
 			pos.column += 2
 		}
 
 		iss := Issue{
 			Pos: token.Position{
-				Filename: start.Filename,
-				Offset:   start.Offset,
-				Line:     pos.line + start.Line - 1,
-				Column:   pos.column + start.Column - 1,
+				Filename: c.start.Filename,
+				Offset:   c.start.Offset,
+				Line:     pos.line + c.start.Line - 1,
+				Column:   pos.column + c.start.Column - 1,
 			},
 			Message: noCapitalMessage,
 		}
 
-		// Make a replacement. Use `pos.line` to get an original line from
+		// Make a replacement. Use `pos.original` to get an original original from
 		// attached lines. Use `iss.Pos.Column` because it's a position in
-		// the original line.
-		rep := []rune(c.lines[pos.line-1])
-		rep[iss.Pos.Column-1] = unicode.ToTitle(rep[iss.Pos.Column-1])
-		iss.Replacement = string(rep)
+		// the original original.
+		original := c.lines[pos.line-1]
+		col := byteToRuneColumn(original, iss.Pos.Column) - 1
+		rep := string(unicode.ToTitle([]rune(original)[col])) // capital letter
+		if len(original) < iss.Pos.Column-1+len(rep) {
+			// This should never happen. Avoid panics, skip this check.
+			continue
+		}
+		iss.Replacement = original[:iss.Pos.Column-1] + rep +
+			original[iss.Pos.Column-1+len(rep):]
 
 		// Save replacement to raw lines to be able to combine it with
 		// further replacements
@@ -172,15 +170,21 @@ func checkPeriod(comment string) (pos position, ok bool) {
 		return position{}, true
 	}
 
-	pos.column = len([]rune(line)) + 1
+	pos.column = len(line) + 1
 	return pos, false
 }
 
-// checkCapital checks that the each sentense of the text starts with
+// checkCapital checks that each sentense of the text starts with
 // a capital letter.
 // NOTE: First letter is not checked in declaration comments, because they
-// can describe unexported functions, which start from small letter.
+// can describe unexported functions, which start with small letter.
 func checkCapital(comment string, skipFirst bool) (pp []position) {
+	// Remove common abbreviations from the comment
+	for _, abbr := range abbreviations {
+		repl := strings.ReplaceAll(abbr, ".", "_")
+		comment = strings.ReplaceAll(comment, abbr, repl)
+	}
+
 	// List of states during the scan: `empty` - nothing special,
 	// `endChar` - found one of sentence ending chars (.!?),
 	// `endOfSentence` - found `endChar`, and then space or newline.
@@ -217,7 +221,10 @@ func checkCapital(comment string, skipFirst bool) (pp []position) {
 			continue
 		}
 		if state == endOfSentence && unicode.IsLower(r) {
-			pp = append(pp, position{line: pos.line, column: pos.column})
+			pp = append(pp, position{
+				line:   pos.line,
+				column: runeToByteColumn(comment, pos.column),
+			})
 		}
 		state = empty
 	}
@@ -274,4 +281,23 @@ func hasSuffix(s string, suffixes []string) bool {
 		}
 	}
 	return false
+}
+
+// The following two functions convert byte and rune indexes.
+//
+// Example:
+//   text:  a b c Ш e f
+//   runes: 1 2 3 4 5 6
+//   bytes: 0 1 2 3 5 6
+// The reason of the difference is that the size of "Ш" is 2 bytes.
+// NOTE: Works only for 1-based indexes (line columns).
+
+// byteToRuneColumn converts byte index inside the string to rune index.
+func byteToRuneColumn(s string, i int) int {
+	return len([]rune(s[:i-1])) + 1
+}
+
+// runeToByteColumn converts rune index inside the string to byte index.
+func runeToByteColumn(s string, i int) int {
+	return len(string([]rune(s)[:i-1])) + 1
 }
